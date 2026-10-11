@@ -15,14 +15,16 @@ import queue
 import re
 import sys
 import threading
+import time
 import tkinter as tk
+import urllib.error
 import urllib.request
 from datetime import datetime
 from tkinter import messagebox, ttk
 
 # Shown in the Help > About box — bump APP_VERSION alongside CHANGELOG.md entries.
 APP_NAME = "SWA Flight Checker"
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 APP_DESCRIPTION = (
     "Fetches live one-way Southwest Airlines flight deals departing your "
     "chosen home airport directly from southwest.com, with distance and "
@@ -69,10 +71,38 @@ def output_path(origin_code, extension):
 MIN_AUTO_REFRESH_MINUTES = 1
 
 
+FETCH_ATTEMPTS = 4
+FETCH_RETRY_DELAY_SECONDS = 2
+
+NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError)
+# How long the GUI waits before quietly retrying after a connection failure.
+# Right after standby or login, Wi-Fi/VPN/DNS can take 20-60s to come back, which
+# is longer than fetch()'s own short retries cover.
+NETWORK_RETRY_SECONDS = 30
+
+
+def is_network_error(exc):
+    """True for connection-level failures (DNS, no route, timeout) as opposed to
+    the server answering with an HTTP error or us failing to parse its data."""
+    return isinstance(exc, NETWORK_ERRORS) and not isinstance(exc, urllib.error.HTTPError)
+
+
 def fetch(url):
+    """GET a URL, retrying connection-level failures (DNS lookup errors like
+    getaddrinfo 11001, dropped Wi-Fi/VPN, timeouts, resets). Those are
+    usually momentary, so a short pause and retry clears them. HTTP errors
+    (404, 403, ...) mean the server answered, so they're raised right away."""
     req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError:
+            raise
+        except NETWORK_ERRORS:
+            if attempt == FETCH_ATTEMPTS:
+                raise
+            time.sleep(FETCH_RETRY_DELAY_SECONDS * attempt)  # 2s, 4s, 6s
 
 
 def fetch_station_directory():
@@ -412,6 +442,9 @@ class App(tk.Tk):
         self.previous_origin_code = None  # last-fetched origin, so price-change diffs don't cross origins
         self.origin_lookup = {}  # dropdown display string -> airport code
         self.origins_queue = queue.Queue()
+        self.fetch_is_auto = False  # True when the running fetch was started by auto-refresh
+        self.network_retry_job = None  # after() id of a pending quiet retry (fares)
+        self.origins_retry_job = None  # after() id of a pending retry (airport list)
         self.last_pdf_path = None
         self.last_xlsx_path = None
 
@@ -507,7 +540,8 @@ class App(tk.Tk):
             airports = fetch_origin_airports()
             self.origins_queue.put(("ok", airports))
         except Exception as exc:
-            self.origins_queue.put(("error", str(exc)))
+            kind = "network_error" if is_network_error(exc) else "error"
+            self.origins_queue.put((kind, str(exc)))
 
     def _poll_origins_queue(self):
         try:
@@ -516,6 +550,15 @@ class App(tk.Tk):
             self.after(200, self._poll_origins_queue)
             return
 
+        if status == "network_error":
+            # Typically the network isn't back yet after standby/login — keep
+            # trying quietly so the dropdown fills in without a restart.
+            self.status_var.set(
+                f"Couldn't load the full airport list ({payload}); showing BWI only. "
+                f"Retrying in {NETWORK_RETRY_SECONDS}s..."
+            )
+            self.origins_retry_job = self.after(NETWORK_RETRY_SECONDS * 1000, self.start_load_origins)
+            return
         if status == "error":
             # Non-fatal — the BWI-only bootstrap entry still works fine.
             self.status_var.set(f"Couldn't load the full airport list ({payload}); showing BWI only.")
@@ -544,8 +587,10 @@ class App(tk.Tk):
         label = self.origin_var.get()
         self.origin_code = self.origin_lookup.get(label, label.split("—", 1)[0].strip())
 
-    def start_fetch(self):
+    def start_fetch(self, auto=False):
+        self._cancel_network_retry()  # a fetch is starting now, so any pending retry is redundant
         self.fetching = True
+        self.fetch_is_auto = auto
         self.fetch_btn.config(state="disabled")
         self.export_pdf_btn.config(state="disabled")
         self.open_pdf_btn.config(state="disabled")
@@ -567,7 +612,18 @@ class App(tk.Tk):
             origin_label, rows = fetch_deals(origin_code)
             self.result_queue.put(("ok", origin_code, origin_label, rows))
         except Exception as exc:
-            self.result_queue.put(("error", str(exc)))
+            kind = "network_error" if is_network_error(exc) else "error"
+            self.result_queue.put((kind, str(exc)))
+
+    def _cancel_network_retry(self):
+        if self.network_retry_job is not None:
+            self.after_cancel(self.network_retry_job)
+            self.network_retry_job = None
+
+    def _network_retry(self):
+        self.network_retry_job = None
+        if self.auto_refresh_active and not self.fetching:
+            self.start_fetch(auto=True)
 
     def _poll_queue(self):
         # Polls (rather than blocking) so the mainloop keeps servicing the
@@ -583,6 +639,26 @@ class App(tk.Tk):
         self.fetch_btn.config(state="normal")
         self.fetching = False
 
+        if result[0] == "network_error":
+            detail = result[1]
+            if self.fetch_is_auto and self.auto_refresh_active:
+                # Unattended refresh (often firing the instant the PC wakes from
+                # standby, before Wi-Fi/DNS is back): no popup, just say so and
+                # try again shortly. The table keeps showing the last good data.
+                self.status_var.set(
+                    f"Couldn't reach southwest.com ({detail}) — network may still be "
+                    f"reconnecting. Retrying in {NETWORK_RETRY_SECONDS}s..."
+                )
+                self.network_retry_job = self.after(NETWORK_RETRY_SECONDS * 1000, self._network_retry)
+                return
+            self.status_var.set(f"Couldn't reach southwest.com ({detail})")
+            messagebox.showerror(
+                "Fetch failed",
+                "Couldn't reach southwest.com. Check your internet connection — it can "
+                "take a little while to come back after standby or login — then try again."
+                f"\n\n{detail}",
+            )
+            return
         if result[0] == "error":
             message = result[1]
             self.status_var.set(f"Error: {message}")
@@ -761,13 +837,14 @@ class App(tk.Tk):
 
         # Fetch right away, then keep firing every interval from here on.
         if not self.fetching:
-            self.start_fetch()
+            self.start_fetch(auto=True)
         self.auto_refresh_job = self.after(self.auto_refresh_ms, self._auto_refresh_tick)
 
     def stop_auto_refresh(self):
         if self.auto_refresh_job is not None:
             self.after_cancel(self.auto_refresh_job)
             self.auto_refresh_job = None
+        self._cancel_network_retry()
         self.auto_refresh_active = False
         self.interval_entry.config(state="normal")
         self.auto_refresh_btn.config(text="Start Auto-Refresh")
@@ -781,12 +858,15 @@ class App(tk.Tk):
         # rather than piling up overlapping requests — the next one will
         # pick it up in another interval.
         if not self.fetching:
-            self.start_fetch()
+            self.start_fetch(auto=True)
         self.auto_refresh_job = self.after(self.auto_refresh_ms, self._auto_refresh_tick)
 
     def _on_close(self):
         if self.auto_refresh_job is not None:
             self.after_cancel(self.auto_refresh_job)
+        self._cancel_network_retry()
+        if self.origins_retry_job is not None:
+            self.after_cancel(self.origins_retry_job)
         self.destroy()
 
 

@@ -4,12 +4,32 @@ All notable changes to `swa_deals_gui.pyw` (formerly `swa_deals_gui.py`,
 and before that `bwi_deals_gui.py`; and its companion script,
 `build_bwi_deals.py`), newest first.
 
-## Unreleased — Renamed to .pyw
+## 1.11.0 — Price-change column, network resilience, packaging
+- Added a **Change vs. Last Fetch** column showing the dollar change per
+  destination since the previous fetch (`+$10`, `-$10`, `$0`; blank when
+  there's nothing to compare against). It's sortable like the other columns.
+- Network resilience, aimed at the intermittent `getaddrinfo failed` (DNS)
+  errors seen after standby or login, when Wi-Fi/VPN/DNS aren't back yet:
+  - Each request now retries up to 4 times with a short pause before giving
+    up. Only connection-level failures are retried; HTTP errors fail
+    immediately.
+  - Auto-refresh no longer pops up an error dialog on a connection failure.
+    It shows a status-bar message and quietly retries every 30 seconds,
+    leaving the last good data on screen. Manual fetches still show a dialog,
+    now with a clearer message.
+  - The home-airport list retries every 30 seconds if it can't load at
+    startup, so the dropdown fills in without restarting the app.
+  - Other errors (e.g. Southwest changing its site) still show immediately
+    and are not retried.
+- The status line (e.g. "Loaded N destinations…") now sits at the bottom of
+  the window instead of above the table.
+- Window opens wider (1100px) so all columns are visible.
+- Exports are saved next to the `.exe` when running as a PyInstaller build
+  (previously they would have gone to a temp folder that's deleted on exit).
 - Script file renamed `swa_deals_gui.py` → `swa_deals_gui.pyw`. On Windows,
   double-clicking a `.pyw` file runs it with `pythonw.exe`, which opens
-  the GUI without a console window flashing up behind it — no code change,
-  just a friendlier double-click experience for a Tkinter app like this
-  one. Command-line use still works the same: `python swa_deals_gui.pyw`.
+  the GUI without a console window flashing up behind it. Command-line use
+  still works: `python swa_deals_gui.pyw`.
 - Updated `SWA Flight Checker.spec` to point at the new filename.
 
 ## 1.10.0 — Renamed to SWA Flight Checker
