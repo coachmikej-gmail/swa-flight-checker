@@ -21,3 +21,6 @@ Thumbs.db
 
 # Local price history database (personal data, changes constantly)
 price_history.db
+
+# Telegram bot token + price watches (contains a secret; never commit)
+settings.json*

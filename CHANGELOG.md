@@ -4,6 +4,34 @@ All notable changes to `swa_deals_gui.pyw` (formerly `swa_deals_gui.py`,
 and before that `bwi_deals_gui.py`; and its companion script,
 `build_bwi_deals.py`), newest first.
 
+## 1.13.0 — Price watches and Telegram alerts
+- **Price watches:** set a target price for any destination (right-click a
+  row, or select it and use the new **Alerts** menu). When that route's fare
+  drops to *or below* the target, a Telegram message is sent with the route,
+  price, departure date, and a direct booking link.
+- **Alerts don't spam.** After an alert, the watch alerts again only if the
+  price drops *further*, or after it has gone back above the target and dipped
+  again (editing a target also re-arms it). A failed send isn't marked as sent
+  and is retried on the next fetch; alerts are sent on a background thread so
+  the window never freezes. A watch that's already at/below target alerts as
+  soon as it's created.
+- **Alerts > View Price Watches** lists every watch with its target, current
+  price, and status (watching / alert sent / alert failed), and lets you edit or
+  remove watches. A short status next to the home-airport dropdown shows the
+  watch count, the last alert sent, or a failure.
+- **Alerts > Telegram Setup** configures the bot: paste the bot token, **Detect
+  Chat ID**, **Send Test Message**, and Save. Includes step-by-step
+  instructions, and the token field is masked by default.
+- **Channels and groups:** alerts can go to a channel or group (e.g. one shared
+  with a partner), not just a private chat. Detect Chat ID now lists every chat
+  the bot knows about (private chats, groups, channels — including a channel
+  the bot was just added to) so you can pick the right one.
+- Bot token, chat ID, and watches are stored in `settings.json`, written
+  atomically; a corrupt file is kept as `settings.json.bad` rather than
+  overwritten. The token is stored in plain text, so `settings.json*` is
+  git-ignored.
+- Price-watch checks apply per home airport, and the README documents setup.
+
 ## 1.12.0 — Price history and chart
 - Prices are now saved locally to a small SQLite database
   (`price_history.db`, next to the script/exe) after every fetch. A route's

@@ -19,10 +19,36 @@ to PDF/XLSX, and auto-refreshed on a timer.
 - Local price history: each route's price is saved to a small SQLite file
   next to the app (`price_history.db`) — only when it changes — and
   double-clicking a row opens a price-over-time chart
+- Price watches: set a target price for any destination and get a Telegram
+  message when the fare drops to or below it
 - Optional auto-refresh on a timer you set, in minutes
 - Export results to a formatted PDF table or an Excel workbook (with live
   formulas, not just hardcoded values)
 - Portable — a single `.pyw` file, or build it into a standalone `.exe`
+
+## Price watches & Telegram alerts
+
+1. **Set up the bot (once):** *Alerts → Telegram Setup...* has step-by-step
+   instructions. In short: message `@BotFather` in Telegram, send `/newbot`,
+   paste the token it gives you, send your new bot any message, then click
+   **Detect Chat ID**, **Send Test Message**, and **Save**.
+   **To alert a channel or group** (e.g. one you share with a partner) instead
+   of your private chat: add the bot to it — for a channel, as an
+   administrator with permission to post messages — post a message there, then
+   click **Detect Chat ID** and pick the channel from the list.
+2. **Set a watch:** fetch fares, then right-click a row (or select it and use
+   *Alerts → Set Price Watch for Selected Row...*) and enter your target price.
+3. **See your watches:** *Alerts → View Price Watches...* lists each watch with
+   its current price and status, and lets you edit or remove them.
+
+A watch alerts when the price is **at or below** your target. It won't repeat
+on every refresh: you're alerted again only if the price drops *further*, or
+after it has gone back above your target and dipped again. A failed send is
+retried on the next fetch.
+
+The bot token, chat ID, and your watches are stored in `settings.json` next to
+the app. The token is in plain text, so keep that file private — it's
+git-ignored, so it won't be committed, but don't share the folder with it inside.
 
 ## Requirements
 

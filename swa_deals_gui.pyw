@@ -19,6 +19,7 @@ import threading
 import time
 import tkinter as tk
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import closing
 from datetime import datetime, timedelta
@@ -26,7 +27,7 @@ from tkinter import messagebox, ttk
 
 # Shown in the Help > About box — bump APP_VERSION alongside CHANGELOG.md entries.
 APP_NAME = "SWA Flight Checker"
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.0"
 APP_DESCRIPTION = (
     "Fetches live one-way Southwest Airlines flight deals departing your "
     "chosen home airport directly from southwest.com, with distance and "
@@ -125,6 +126,162 @@ def load_price_history(origin_code, dest_code):
             (origin_code, dest_code),
         ).fetchall()
     return [(datetime.strptime(at, HISTORY_TIME_FORMAT), price, dep) for at, price, dep in found]
+
+
+# --- Settings (settings.json): Telegram bot config + price watches -----------
+# Holds the bot token, which is a secret, so it's git-ignored. Kept next to the
+# script/exe like the exports and history database.
+SETTINGS_PATH = os.path.join(OUTPUT_DIR, "settings.json")
+
+
+def default_settings():
+    return {"telegram": {"bot_token": "", "chat_id": ""}, "watches": []}
+
+
+def load_settings():
+    """Returns (settings, warning). A missing file is normal (fresh install). A
+    file that isn't valid JSON is moved aside to settings.json.bad rather than
+    silently overwritten, and `warning` says so."""
+    settings = default_settings()
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return settings, None
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        try:
+            os.replace(SETTINGS_PATH, SETTINGS_PATH + ".bad")
+            moved = " (the old file was kept as settings.json.bad)"
+        except OSError:
+            moved = ""
+        return settings, f"Couldn't read settings.json ({exc}); starting with empty settings{moved}."
+
+    if not isinstance(data, dict):
+        return settings, "settings.json isn't in the expected format; starting with empty settings."
+    telegram = data.get("telegram")
+    if isinstance(telegram, dict):
+        settings["telegram"]["bot_token"] = str(telegram.get("bot_token") or "")
+        settings["telegram"]["chat_id"] = str(telegram.get("chat_id") or "")
+    for watch in data.get("watches") or []:
+        # Skip malformed entries instead of failing the whole file.
+        if (isinstance(watch, dict) and watch.get("origin") and watch.get("dest")
+                and isinstance(watch.get("target"), (int, float)) and watch["target"] > 0):
+            settings["watches"].append({
+                "origin": str(watch["origin"]),
+                "dest": str(watch["dest"]),
+                "city": str(watch.get("city") or ""),
+                "state": str(watch.get("state") or ""),
+                "target": watch["target"],
+                "created": watch.get("created"),
+                "last_alert_price": watch.get("last_alert_price"),
+                "last_alert_at": watch.get("last_alert_at"),
+            })
+    return settings, None
+
+
+def save_settings(settings):
+    """Write via a temp file + rename so a crash mid-write can't leave a
+    half-written (unparseable) settings.json."""
+    tmp_path = SETTINGS_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+    os.replace(tmp_path, SETTINGS_PATH)
+
+
+def fmt_money(amount):
+    return f"${amount:,.0f}" if float(amount).is_integer() else f"${amount:,.2f}"
+
+
+# --- Telegram -------------------------------------------------------------------
+TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/{method}"
+
+
+class TelegramError(Exception):
+    """A Telegram call failed; the message is safe to show (never contains the token)."""
+
+
+def telegram_call(token, method, params=None, timeout=10):
+    """POST to the Telegram Bot API and return the `result` field. Telegram
+    explains failures in the JSON body ({"ok": false, "description": ...}), e.g.
+    "Unauthorized" for a bad token or "chat not found" for a wrong chat ID."""
+    url = TELEGRAM_API_URL.format(token=token, method=method)
+    request = urllib.request.Request(url, data=urllib.parse.urlencode(params or {}).encode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            description = json.loads(exc.read().decode("utf-8")).get("description")
+        except (ValueError, OSError):
+            description = None
+        raise TelegramError(description or f"Telegram returned HTTP {exc.code}") from None
+    except NETWORK_ERRORS as exc:
+        # `from None` + our own message: keeps the request URL (which contains the token) out of any traceback.
+        reason = getattr(exc, "reason", exc)
+        raise TelegramError(f"Couldn't reach Telegram ({reason})") from None
+    except ValueError:
+        raise TelegramError("Telegram sent a reply that couldn't be read") from None
+    if not body.get("ok"):
+        raise TelegramError(body.get("description") or "Telegram rejected the request")
+    return body.get("result")
+
+
+def send_telegram(token, chat_id, text):
+    telegram_call(token, "sendMessage", {"chat_id": chat_id, "text": text})
+
+
+TELEGRAM_CHAT_KINDS = {"private": "private chat", "group": "group", "supergroup": "group", "channel": "channel"}
+
+
+def detect_telegram_chats(token):
+    """Every chat the bot has seen recently, newest first, as (chat_id, name, kind) —
+    private chats, groups, and channels. That includes the "bot was added" event
+    Telegram sends when you add the bot to a channel/group, so a freshly added
+    channel shows up even before anyone posts in it."""
+    updates = telegram_call(token, "getUpdates", {"limit": 100}) or []
+    found = {}
+    for update in reversed(updates):
+        source = (update.get("message") or update.get("edited_message") or update.get("channel_post")
+                  or update.get("edited_channel_post") or update.get("my_chat_member"))
+        chat = (source or {}).get("chat") or {}
+        if chat.get("id") is None or str(chat["id"]) in found:
+            continue
+        name = chat.get("title") or " ".join(
+            part for part in (chat.get("first_name"), chat.get("last_name")) if part
+        ) or chat.get("username") or "chat"
+        found[str(chat["id"])] = (str(chat["id"]), name, TELEGRAM_CHAT_KINDS.get(chat.get("type"), "chat"))
+    if not found:
+        raise TelegramError(
+            "No chats found. Send your bot a message (e.g. \"hi\"). For a channel or group, add the "
+            "bot to it (channels: as an administrator who can post messages) and post a message there. "
+            "Then click Detect again."
+        )
+    return list(found.values())
+
+
+def booking_url(origin, dest, depart_date):
+    """Deep link to Southwest's booking page for this route/date — the same URL
+    format the flight-deals page's own \"Book now\" links use."""
+    query = urllib.parse.urlencode({
+        "promoCode": "", "adultPassengersCount": 1, "lapInfantPassengersCount": 0,
+        "departureDate": depart_date.isoformat(), "destinationAirportCode": dest,
+        "fareType": "USD", "originationAirportCode": origin, "passengerType": "ADULT",
+        "returnDate": "", "tripType": "oneway", "departureTimeOfDay": "ALL_DAY",
+        "reset": "true", "returnTimeOfDay": "ALL_DAY",
+    })
+    return f"https://www.southwest.com/air/booking/select-depart.html?{query}"
+
+
+def format_alert(watch, row):
+    """Plain-text Telegram message (no Markdown, so city names with ()_ can't break formatting)."""
+    _rank, city, state, code, _dist, depart_date, price, _mpd = row
+    return (
+        f"✈️ SWA price alert\n"
+        f"{watch['origin']} → {code}  ({city}, {state})\n"
+        f"Now {fmt_money(price)} one-way — at or below your {fmt_money(watch['target'])} watch\n"
+        f"Departing {fmt_date(depart_date)}\n"
+        f"{booking_url(watch['origin'], code, depart_date)}"
+    )
 
 
 # Floor on the auto-refresh interval so a typo (or "0") can't hammer southwest.com.
@@ -615,6 +772,287 @@ class PriceHistoryWindow(tk.Toplevel):
         c.tag_lower(box, text)
 
 
+class WatchDialog(tk.Toplevel):
+    """Set (or edit) the price target for one route. `on_save(target)` is called
+    with a validated number; `on_remove()` (optional) removes an existing watch."""
+
+    def __init__(self, master, origin, dest, city, state, current_price, existing_target, on_save, on_remove=None):
+        super().__init__(master)
+        self.title("Edit Price Watch" if existing_target is not None else "Set Price Watch")
+        self.resizable(False, False)
+        self.transient(master)
+        self.on_save, self.on_remove = on_save, on_remove
+
+        body = ttk.Frame(self, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=f"{origin} → {dest}   {city}, {state}", font=("Segoe UI", 11, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        current = fmt_money(current_price) if current_price is not None else "unknown (fetch first)"
+        ttk.Label(body, text=f"Current price: {current}").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 12))
+
+        ttk.Label(body, text="Notify me when the price is at or below  $").grid(row=2, column=0, sticky="w")
+        self.target_var = tk.StringVar(value="" if existing_target is None else f"{existing_target:g}")
+        self.entry = ttk.Entry(body, textvariable=self.target_var, width=8)
+        self.entry.grid(row=2, column=1, sticky="w", padx=(2, 0))
+        self.error_var = tk.StringVar()
+        ttk.Label(body, textvariable=self.error_var, foreground="#b00020").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=4, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        if on_remove is not None:
+            ttk.Button(buttons, text="Remove Watch", command=self._remove).pack(side="left", padx=(0, 16))
+        ttk.Button(buttons, text="Save", command=self.save).pack(side="left")
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=(8, 0))
+
+        self.entry.focus_set()
+        self.bind("<Return>", lambda _e: self.save())
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    def save(self):
+        text = self.target_var.get().strip().lstrip("$").replace(",", "")
+        try:
+            target = float(text)
+        except ValueError:
+            self.error_var.set("Enter a dollar amount, e.g. 90")
+            return
+        if not 0 < target <= 100000:
+            self.error_var.set("Enter an amount greater than $0.")
+            return
+        self.destroy()
+        self.on_save(int(target) if target.is_integer() else target)
+
+    def _remove(self):
+        self.destroy()
+        self.on_remove()
+
+
+class ChatPickerDialog(tk.Toplevel):
+    """Choose which detected Telegram chat (private chat, group, or channel) to send alerts to."""
+
+    def __init__(self, master, chats, on_pick):
+        super().__init__(master)
+        self.title("Choose a Chat")
+        self.resizable(False, False)
+        self.transient(master)
+        self.chats, self.on_pick = chats, on_pick
+
+        body = ttk.Frame(self, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Telegram found these chats. Which should get the alerts?").pack(anchor="w")
+        self.listbox = tk.Listbox(body, width=62, height=min(max(len(chats), 3), 10), activestyle="none", exportselection=False)
+        for chat_id, name, kind in chats:
+            self.listbox.insert("end", f"{name}   ({kind})   {chat_id}")
+        self.listbox.selection_set(0)
+        self.listbox.pack(pady=(8, 12))
+        self.listbox.bind("<Double-1>", lambda _e: self.choose())
+
+        buttons = ttk.Frame(body)
+        buttons.pack(anchor="e")
+        ttk.Button(buttons, text="Use Selected", command=self.choose).pack(side="left")
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=(8, 0))
+        self.bind("<Return>", lambda _e: self.choose())
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    def choose(self):
+        selection = self.listbox.curselection()
+        if selection:
+            chat = self.chats[selection[0]]
+            self.destroy()
+            self.on_pick(chat)
+
+
+class TelegramSetupWindow(tk.Toplevel):
+    """Configure the Telegram bot (token + chat ID), test it, and save to settings.json."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Telegram Setup")
+        self.resizable(False, False)
+        self.transient(app)
+
+        body = ttk.Frame(self, padding=16)
+        body.pack(fill="both", expand=True)
+        steps = (
+            "How to set up alerts:\n"
+            "1. In Telegram, message @BotFather, send /newbot, and follow the prompts.\n"
+            "    It gives you a bot token — paste it below.\n"
+            "2. Send your new bot any message (e.g. \"hi\").\n"
+            "    To alert a channel or group instead (so others get them too), add the bot to it —\n"
+            "    for a channel, as an administrator who can post messages — and post a message there.\n"
+            "3. Click Detect Chat ID and pick the chat (or type a chat ID in yourself).\n"
+            "4. Click Send Test Message, then Save."
+        )
+        ttk.Label(body, text=steps, justify="left").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+
+        saved = app.settings["telegram"]
+        ttk.Label(body, text="Bot token:").grid(row=1, column=0, sticky="w")
+        self.token_var = tk.StringVar(value=saved["bot_token"])
+        self.token_entry = ttk.Entry(body, textvariable=self.token_var, width=48, show="•")
+        self.token_entry.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        self.show_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(body, text="Show", variable=self.show_var, command=self._toggle_show).grid(
+            row=1, column=2, sticky="w", padx=(8, 0))
+
+        ttk.Label(body, text="Chat ID:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.chat_var = tk.StringVar(value=saved["chat_id"])
+        ttk.Entry(body, textvariable=self.chat_var, width=24).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Button(body, text="Detect Chat ID", command=self.detect).grid(row=2, column=2, padx=(8, 0), pady=(8, 0))
+
+        self.result_var = tk.StringVar()
+        self.result_label = ttk.Label(body, textvariable=self.result_var, wraplength=520, justify="left")
+        self.result_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        ttk.Label(
+            body, foreground="#666666", wraplength=520, justify="left",
+            text="The token is stored in plain text in settings.json next to the app. Keep that file private "
+                 "(it's excluded from git), and don't share it.",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=5, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        ttk.Button(buttons, text="Send Test Message", command=self.send_test).pack(side="left")
+        ttk.Button(buttons, text="Save", command=self.save).pack(side="left", padx=(16, 0))
+        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="left", padx=(8, 0))
+
+    def _toggle_show(self):
+        self.token_entry.config(show="" if self.show_var.get() else "•")
+
+    def _say(self, text, ok=True):
+        self.result_var.set(text)
+        self.result_label.config(foreground="#1b7f3b" if ok else "#b00020")
+        self.update_idletasks()
+
+    def _credentials(self, need_chat=True):
+        token, chat = self.token_var.get().strip(), self.chat_var.get().strip()
+        if not token:
+            self._say("Enter the bot token first.", ok=False)
+            return None
+        if need_chat and not chat:
+            self._say("Enter a chat ID, or click Detect Chat ID.", ok=False)
+            return None
+        return token, chat
+
+    def detect(self):
+        creds = self._credentials(need_chat=False)
+        if not creds:
+            return
+        self._say("Contacting Telegram...")
+        try:
+            chats = detect_telegram_chats(creds[0])
+        except TelegramError as exc:
+            self._say(str(exc), ok=False)
+            return
+        if len(chats) == 1:
+            self._use_chat(chats[0])
+        else:
+            self._say(f"Found {len(chats)} chats - choose one.")
+            ChatPickerDialog(self, chats, self._use_chat)
+
+    def _use_chat(self, chat):
+        chat_id, name, kind = chat
+        self.chat_var.set(chat_id)
+        self._say(f"Using {name} ({kind}, {chat_id}). Click Send Test Message to confirm, then Save.")
+
+    def send_test(self):
+        creds = self._credentials()
+        if not creds:
+            return
+        self._say("Sending...")
+        try:
+            send_telegram(creds[0], creds[1], f"✅ {APP_NAME}: Telegram alerts are set up.")
+        except TelegramError as exc:
+            self._say(f"Test failed: {exc}", ok=False)
+            return
+        self._say("Test message sent — check Telegram. Click Save to keep these settings.")
+
+    def save(self):
+        try:
+            self.app.save_telegram_settings(self.token_var.get().strip(), self.chat_var.get().strip())
+        except OSError as exc:
+            self._say(f"Couldn't save settings.json: {exc}", ok=False)
+            return
+        self._say("Saved to settings.json.")
+
+
+class WatchManagerWindow(tk.Toplevel):
+    """Lists every price watch with its current price and status; edit or remove them."""
+
+    COLUMNS = (("route", "Route", 90), ("dest", "Destination", 190), ("target", "Alert at or below", 120),
+               ("current", "Current", 80), ("status", "Status", 420))
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Price Watches")
+        self.geometry("960x360")
+        self.minsize(700, 260)
+
+        self.telegram_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.telegram_var, padding=(10, 8)).pack(fill="x")
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=10)
+        self.tree = ttk.Treeview(frame, columns=[c[0] for c in self.COLUMNS], show="headings", selectmode="browse")
+        for key, label, width in self.COLUMNS:
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width, anchor="w" if key in ("dest", "status") else "center")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.tree.bind("<Double-1>", lambda _e: self.edit())
+
+        self.empty_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.empty_var, foreground="#666666", padding=(10, 6)).pack(fill="x")
+
+        buttons = ttk.Frame(self, padding=(10, 0, 10, 10))
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Edit Target...", command=self.edit).pack(side="left")
+        ttk.Button(buttons, text="Remove", command=self.remove).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Telegram Setup...", command=app.open_telegram_setup).pack(side="left", padx=(24, 0))
+        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right")
+        self.refresh()
+
+    def refresh(self):
+        selected = self.tree.selection()
+        self.tree.delete(*self.tree.get_children())
+        for index, watch in enumerate(self.app.settings["watches"]):
+            current, status = self.app.describe_watch(watch)
+            self.tree.insert("", "end", iid=str(index), values=(
+                f"{watch['origin']} → {watch['dest']}", f"{watch['city']}, {watch['state']}".strip(", "),
+                f"≤ {fmt_money(watch['target'])}", fmt_money(current) if current is not None else "—", status))
+        if selected and self.tree.exists(selected[0]):
+            self.tree.selection_set(selected[0])
+        cfg = self.app.settings["telegram"]
+        self.telegram_var.set(
+            "Telegram: set up — alerts will be sent." if cfg["bot_token"] and cfg["chat_id"]
+            else "Telegram: NOT set up — alerts can't be sent until you configure it (button below)."
+        )
+        self.empty_var.set(
+            "" if self.app.settings["watches"]
+            else "No price watches yet. Select a row in the main table (or right-click it) and choose Set Price Watch."
+        )
+
+    def _selected_watch(self):
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("Price Watches", "Select a watch first.", parent=self)
+            return None
+        return self.app.settings["watches"][int(selection[0])]
+
+    def edit(self):
+        watch = self._selected_watch()
+        if watch:
+            self.app.open_watch_dialog(watch["origin"], watch["dest"], watch["city"], watch["state"])
+
+    def remove(self):
+        watch = self._selected_watch()
+        if watch and messagebox.askyesno(
+                "Remove watch", f"Stop watching {watch['origin']} → {watch['dest']}?", parent=self):
+            self.app.remove_watch(watch["origin"], watch["dest"])
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -624,10 +1062,27 @@ class App(tk.Tk):
         self.geometry("1100x560")
 
         menubar = tk.Menu(self)
+        alerts_menu = tk.Menu(menubar, tearoff=0)
+        alerts_menu.add_command(label="Set Price Watch for Selected Row...", command=self.set_watch_for_selected_row)
+        alerts_menu.add_command(label="View Price Watches...", command=self.open_watch_manager)
+        alerts_menu.add_separator()
+        alerts_menu.add_command(label="Telegram Setup...", command=self.open_telegram_setup)
+        menubar.add_cascade(label="Alerts", menu=alerts_menu)
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="About", command=self.show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
         self.config(menu=menubar)
+
+        # Price watches + Telegram config, persisted in settings.json.
+        self.settings, settings_warning = load_settings()
+        self.pending_alerts = set()  # (origin, dest) keys with a Telegram send in flight
+        self.watch_errors = {}       # (origin, dest) -> last send-failure text, until it succeeds
+        self.notify_queue = queue.Queue()
+        self.notify_outstanding = 0
+        self.notify_polling = False
+        self.alert_note = ("", False)  # (text, is_error) shown in the alert label until replaced
+        self.watch_manager = None
+        self.telegram_setup = None
 
         self.rows = []
         self.display_rows = []
@@ -669,6 +1124,9 @@ class App(tk.Tk):
         )
         self.origin_combo.pack(side="left", padx=(4, 0))
         self.origin_combo.bind("<<ComboboxSelected>>", self.on_origin_selected)
+        # Short alert status on the right of this row (watch count / last alert sent / failure).
+        self.alert_label = ttk.Label(origin_frame, text="", foreground="#444444")
+        self.alert_label.pack(side="right")
 
         self.fetch_btn = ttk.Button(top, text="Fetch Latest Deals", command=self.start_fetch)
         self.fetch_btn.pack(side="left")
@@ -699,7 +1157,7 @@ class App(tk.Tk):
         ttk.Label(refresh, text="minutes").pack(side="left")
         self.auto_refresh_btn = ttk.Button(refresh, text="Start Auto-Refresh", command=self.toggle_auto_refresh)
         self.auto_refresh_btn.pack(side="left", padx=(8, 0))
-        ttk.Label(refresh, text="Tip: double-click a row to see its price history",
+        ttk.Label(refresh, text="Tip: double-click a row for its price history  |  right-click to set a price watch",
                   foreground="#666666").pack(side="right")
 
         self.status_var = tk.StringVar(value="Click \"Fetch Latest Deals\" to load current fares from southwest.com.")
@@ -730,12 +1188,20 @@ class App(tk.Tk):
         self.tree.tag_configure("price_up", background="#f8d7da")    # light red
         self.tree.tag_configure("price_down", background="#d4edda")  # light green
         self.tree.bind("<Double-1>", self.on_row_double_click)
+        self.row_menu = tk.Menu(self, tearoff=0)
+        self.row_menu.add_command(label="Set Price Watch...", command=self.set_watch_for_selected_row)
+        self.row_menu.add_command(label="View Price History", command=self.show_history_for_selected_row)
+        self.tree.bind("<Button-3>", self.on_row_right_click)
 
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
         vsb.pack(side="right", fill="y", pady=10)
 
+        self._update_alert_label()
+        if settings_warning:
+            # Rare (unreadable settings.json); a popup so it isn't lost in the status bar.
+            self.after(300, lambda: messagebox.showwarning("Settings", settings_warning))
         self.start_load_origins()
 
     def start_load_origins(self):
@@ -934,12 +1400,26 @@ class App(tk.Tk):
             status += f" (Couldn't save price history: {exc})"
         self.status_var.set(status)
 
+        self._evaluate_watches(origin_code, payload)
+
     def on_row_double_click(self, event):
         if self.tree.identify_region(event.x, event.y) != "cell":
             return  # a double-click on a column header or empty space
         item = self.tree.identify_row(event.y)
-        if not item:
+        if item:
+            self._show_history_for_item(item)
+
+    def on_row_right_click(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item or self.tree.identify_region(event.x, event.y) != "cell":
             return
+        self.tree.selection_set(item)
+        try:
+            self.row_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.row_menu.grab_release()
+
+    def _show_history_for_item(self, item):
         values = self.tree.item(item, "values")
         city, state, dest = values[1], values[2], values[3]
         # previous_origin_code is the origin of the rows currently in the table;
@@ -951,6 +1431,242 @@ class App(tk.Tk):
             messagebox.showerror("Price history", f"Couldn't read the price history: {exc}")
             return
         PriceHistoryWindow(self, f"Price history — {city}, {state} ({origin} → {dest})", history)
+
+    def _selected_route(self):
+        """(origin, dest, city, state) for the selected table row, or None (after telling the user)."""
+        selection = self.tree.selection()
+        if not selection or self.previous_origin_code is None:
+            messagebox.showinfo("Price watch", "Fetch the fares first, then select a row.")
+            return None
+        values = self.tree.item(selection[0], "values")
+        return self.previous_origin_code, values[3], values[1], values[2]
+
+    def show_history_for_selected_row(self):
+        if self._selected_route():
+            self._show_history_for_item(self.tree.selection()[0])
+
+    # --- Price watches & Telegram alerts -------------------------------------
+
+    def watch_for(self, origin, dest):
+        return next((w for w in self.settings["watches"] if w["origin"] == origin and w["dest"] == dest), None)
+
+    def telegram_configured(self):
+        cfg = self.settings["telegram"]
+        return bool(cfg["bot_token"] and cfg["chat_id"])
+
+    def current_price(self, origin, dest):
+        """Latest known price: the loaded table if it's for this origin, else the
+        newest entry in the price history (which only changes when the price does)."""
+        if self.previous_origin_code == origin:
+            for row in self.rows:
+                if row[3] == dest:
+                    return row[6]
+        try:
+            history = load_price_history(origin, dest)
+        except (sqlite3.Error, OSError):
+            return None
+        return history[-1][1] if history else None
+
+    def describe_watch(self, watch):
+        """(current_price_or_None, status_text) for the Price Watches window."""
+        key = (watch["origin"], watch["dest"])
+        current = self.current_price(*key)
+        if key in self.watch_errors:
+            return current, f"Alert failed: {self.watch_errors[key]} (retries on next fetch)"
+        if key in self.pending_alerts:
+            return current, "Sending alert..."
+        if current is None:
+            return current, "Waiting for a price (fetch first)"
+        if current <= watch["target"]:
+            if watch.get("last_alert_price") is not None:
+                try:
+                    when = datetime.strptime(watch["last_alert_at"], HISTORY_TIME_FORMAT).strftime("%m/%d %H:%M")
+                except (TypeError, ValueError):
+                    when = "earlier"
+                return current, f"At/below target - alert sent {when} at {fmt_money(watch['last_alert_price'])}"
+            return current, "At/below target - alert pending (is Telegram set up?)"
+        return current, f"Watching - {fmt_money(current - watch['target'])} above target"
+
+    def _persist_settings(self):
+        try:
+            save_settings(self.settings)
+            return True
+        except OSError as exc:
+            self._set_alert_note("Couldn't save settings.json", error=True)
+            messagebox.showerror("Settings", f"Couldn't save settings.json: {exc}")
+            return False
+
+    def _set_alert_note(self, text, error=False):
+        self.alert_note = (text, error)
+        self._update_alert_label()
+
+    def _update_alert_label(self):
+        text, is_error = self.alert_note
+        if not text:
+            count = len(self.settings["watches"])
+            if count:
+                text = f"{count} price watch{'es' if count != 1 else ''} active"
+                if not self.telegram_configured():
+                    text += " (Telegram not set up)"
+        self.alert_label.config(text=text, foreground="#b00020" if is_error else "#444444")
+
+    def _after_watches_changed(self):
+        if not self.settings["watches"] and not self.alert_note[1]:
+            self.alert_note = ("", False)
+        self._update_alert_label()
+        if self.watch_manager is not None and self.watch_manager.winfo_exists():
+            self.watch_manager.refresh()
+
+    def open_watch_manager(self):
+        if self.watch_manager is not None and self.watch_manager.winfo_exists():
+            self.watch_manager.refresh()
+            self.watch_manager.lift()
+        else:
+            self.watch_manager = WatchManagerWindow(self)
+
+    def open_telegram_setup(self):
+        if self.telegram_setup is not None and self.telegram_setup.winfo_exists():
+            self.telegram_setup.lift()
+        else:
+            self.telegram_setup = TelegramSetupWindow(self)
+
+    def save_telegram_settings(self, token, chat_id):
+        self.settings["telegram"] = {"bot_token": token, "chat_id": chat_id}
+        save_settings(self.settings)  # OSError propagates to the setup window, which reports it
+        self.watch_errors.clear()  # old send failures may be fixed by the new settings
+        self._after_watches_changed()
+        if self.previous_origin_code is not None:
+            # Watches that were already at/below target (waiting on Telegram) can alert now.
+            self._evaluate_watches(self.previous_origin_code, self.rows)
+
+    def set_watch_for_selected_row(self):
+        route = self._selected_route()
+        if route:
+            self.open_watch_dialog(*route)
+
+    def open_watch_dialog(self, origin, dest, city, state):
+        existing = self.watch_for(origin, dest)
+        WatchDialog(
+            self, origin, dest, city, state, self.current_price(origin, dest),
+            existing["target"] if existing else None,
+            on_save=lambda target: self._save_watch(origin, dest, city, state, target),
+            on_remove=(lambda: self.remove_watch(origin, dest)) if existing else None,
+        )
+
+    def _save_watch(self, origin, dest, city, state, target):
+        watch = self.watch_for(origin, dest)
+        if watch is None:
+            watch = {"origin": origin, "dest": dest, "city": city, "state": state, "target": target,
+                     "created": datetime.now().strftime(HISTORY_TIME_FORMAT),
+                     "last_alert_price": None, "last_alert_at": None}
+            self.settings["watches"].append(watch)
+        else:
+            watch["target"] = target
+            watch["last_alert_price"] = watch["last_alert_at"] = None  # re-arm so the new target can alert right away
+        self.watch_errors.pop((origin, dest), None)
+        if not self._persist_settings():
+            return
+        self._after_watches_changed()
+        if self.previous_origin_code == origin:
+            self._evaluate_watches(origin, self.rows)  # the current price may already be at/below the target
+        if not self.telegram_configured() and messagebox.askyesno(
+                "Telegram not set up",
+                "Watch saved, but alerts can't be sent until Telegram is set up. Set it up now?"):
+            self.open_telegram_setup()
+
+    def remove_watch(self, origin, dest):
+        self.settings["watches"] = [
+            w for w in self.settings["watches"] if not (w["origin"] == origin and w["dest"] == dest)
+        ]
+        self.watch_errors.pop((origin, dest), None)
+        self.pending_alerts.discard((origin, dest))
+        if self._persist_settings():
+            self._after_watches_changed()
+
+    def _evaluate_watches(self, origin_code, rows):
+        """Compare each watch for this origin with the fresh prices and send alerts.
+
+        Alert rules, so a watch doesn't spam you on every auto-refresh:
+        - price at or below the target and no alert sent yet -> alert
+        - already alerted -> alert again only if the price drops *below* the last alerted price
+        - price back above the target -> re-arm (the next dip alerts again)
+        A watch whose send failed (or Telegram isn't set up) isn't marked as alerted,
+        so it's retried on the next fetch."""
+        by_code = {row[3]: row for row in rows}
+        jobs, unsent_hits, rearmed = [], [], False
+        for watch in self.settings["watches"]:
+            if watch["origin"] != origin_code or watch["dest"] not in by_code:
+                continue
+            row = by_code[watch["dest"]]
+            key = (watch["origin"], watch["dest"])
+            price, last = row[6], watch.get("last_alert_price")
+            if price > watch["target"]:
+                if last is not None:
+                    watch["last_alert_price"] = watch["last_alert_at"] = None
+                    rearmed = True
+                continue
+            if key in self.pending_alerts or (last is not None and price >= last):
+                continue
+            if self.telegram_configured():
+                jobs.append((key, format_alert(watch, row), price))
+            else:
+                unsent_hits.append(f"{watch['dest']} {fmt_money(price)}")
+
+        if rearmed:
+            self._persist_settings()
+        if jobs:
+            self._start_notify(jobs)
+        elif unsent_hits:
+            self._set_alert_note(f"Watch hit ({', '.join(unsent_hits)}) - set up Telegram", error=True)
+        self._after_watches_changed()
+
+    def _start_notify(self, jobs):
+        cfg = self.settings["telegram"]
+        for key, _text, _price in jobs:
+            self.pending_alerts.add(key)
+        self.notify_outstanding += len(jobs)
+        threading.Thread(
+            target=self._notify_worker, args=(cfg["bot_token"], cfg["chat_id"], jobs), daemon=True
+        ).start()
+        if not self.notify_polling:
+            self.notify_polling = True
+            self.after(200, self._poll_notify_queue)
+
+    def _notify_worker(self, token, chat_id, jobs):
+        # Background thread: only talks to the network and the queue, never to widgets.
+        for key, text, price in jobs:
+            try:
+                send_telegram(token, chat_id, text)
+                self.notify_queue.put((key, price, None))
+            except TelegramError as exc:
+                self.notify_queue.put((key, price, str(exc)))
+            except Exception as exc:  # anything unexpected must still report back, or the poller would wait forever
+                self.notify_queue.put((key, price, f"unexpected error: {exc}"))
+
+    def _poll_notify_queue(self):
+        try:
+            while True:
+                key, price, error = self.notify_queue.get_nowait()
+                self.notify_outstanding -= 1
+                self.pending_alerts.discard(key)
+                watch = self.watch_for(*key)
+                if error is None:
+                    self.watch_errors.pop(key, None)
+                    if watch is not None:  # (it may have been removed while the message was in flight)
+                        watch["last_alert_price"] = price
+                        watch["last_alert_at"] = datetime.now().strftime(HISTORY_TIME_FORMAT)
+                        self._persist_settings()
+                    self._set_alert_note(f"Alert sent: {key[1]} {fmt_money(price)} at {datetime.now():%H:%M}")
+                else:
+                    self.watch_errors[key] = error
+                    self._set_alert_note(f"Alert FAILED for {key[1]} (see Alerts > View Price Watches)", error=True)
+        except queue.Empty:
+            pass
+        self._after_watches_changed()
+        if self.notify_outstanding > 0:
+            self.after(200, self._poll_notify_queue)
+        else:
+            self.notify_polling = False
 
     def populate_tree(self):
         self.tree.delete(*self.tree.get_children())
