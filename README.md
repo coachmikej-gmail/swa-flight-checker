@@ -16,6 +16,9 @@ to PDF/XLSX, and auto-refreshed on a timer.
 - Distance (great-circle miles) and miles-per-dollar value for each route
 - Click any column header to sort; click again to reverse
 - Row highlighting (red/green) showing price changes since your last fetch
+- Local price history: each route's price is saved to a small SQLite file
+  next to the app (`price_history.db`) — only when it changes — and
+  double-clicking a row opens a price-over-time chart
 - Optional auto-refresh on a timer you set, in minutes
 - Export results to a formatted PDF table or an Excel workbook (with live
   formulas, not just hardcoded values)

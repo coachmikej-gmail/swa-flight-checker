@@ -18,3 +18,6 @@ Thumbs.db
 # Editor/IDE
 .vscode/
 .idea/
+
+# Local price history database (personal data, changes constantly)
+price_history.db

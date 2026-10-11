@@ -4,6 +4,26 @@ All notable changes to `swa_deals_gui.pyw` (formerly `swa_deals_gui.py`,
 and before that `bwi_deals_gui.py`; and its companion script,
 `build_bwi_deals.py`), newest first.
 
+## 1.12.0 — Price history and chart
+- Prices are now saved locally to a small SQLite database
+  (`price_history.db`, next to the script/exe) after every fetch. A route's
+  price is only written when it differs from the last one stored for that
+  route, so the file grows with price *changes*, not with every fetch. Each
+  home airport keeps its own history, and a route's first fetch is saved as
+  its starting point.
+- Double-click any row to open a price-history chart for that route: a step
+  line (a price holds until it changes) with labeled points, hover tooltips
+  (price, date/time, departure date), and a summary of current / lowest /
+  highest price. A dashed segment extends the latest price to today to show
+  it's still current. Double-clicking a column header or empty space does
+  nothing.
+- The chart is drawn with Tkinter's built-in canvas, so there's no new
+  dependency (matplotlib would have added ~30 MB to the .exe).
+- The status bar reports how many prices were saved after each fetch, and a
+  failure to write history never fails the fetch itself.
+- Added a tip next to the auto-refresh controls pointing out the
+  double-click, and `price_history.db` to `.gitignore`.
+
 ## 1.11.0 — Price-change column, network resilience, packaging
 - Added a **Change vs. Last Fetch** column showing the dollar change per
   destination since the previous fetch (`+$10`, `-$10`, `$0`; blank when

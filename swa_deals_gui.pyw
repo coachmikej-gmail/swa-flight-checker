@@ -13,18 +13,20 @@ import math
 import os
 import queue
 import re
+import sqlite3
 import sys
 import threading
 import time
 import tkinter as tk
 import urllib.error
 import urllib.request
-from datetime import datetime
+from contextlib import closing
+from datetime import datetime, timedelta
 from tkinter import messagebox, ttk
 
 # Shown in the Help > About box — bump APP_VERSION alongside CHANGELOG.md entries.
 APP_NAME = "SWA Flight Checker"
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 APP_DESCRIPTION = (
     "Fetches live one-way Southwest Airlines flight deals departing your "
     "chosen home airport directly from southwest.com, with distance and "
@@ -65,6 +67,64 @@ def output_path(origin_code, extension):
     """Per-origin output filename, e.g. BWI_Flight_Deals.pdf / ORD_Flight_Deals.xlsx
     — keeps exports for different home airports from overwriting each other."""
     return os.path.join(OUTPUT_DIR, f"{origin_code}_Flight_Deals.{extension}")
+
+
+# Local price history (SQLite). Lives next to the script/exe like the exports.
+HISTORY_DB_PATH = os.path.join(OUTPUT_DIR, "price_history.db")
+HISTORY_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _open_history_db():
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS price_history (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               origin TEXT NOT NULL,
+               dest TEXT NOT NULL,
+               recorded_at TEXT NOT NULL,
+               price INTEGER NOT NULL,
+               depart_date TEXT
+           )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_route ON price_history (origin, dest, id)")
+    return conn
+
+
+def record_prices(origin_code, rows, when=None):
+    """Append each route's price to the history, but only if it differs from the
+    last price stored for that route (or the route has no history yet), so the
+    table grows with price *changes*, not with every fetch. Returns how many
+    rows were written. `rows` are fetch_deals() rows."""
+    stamp = (when or datetime.now()).strftime(HISTORY_TIME_FORMAT)
+    with closing(_open_history_db()) as conn:
+        last = dict(conn.execute(
+            """SELECT p.dest, p.price FROM price_history p
+               JOIN (SELECT dest, MAX(id) AS last_id FROM price_history
+                     WHERE origin = ? GROUP BY dest) m ON p.id = m.last_id""",
+            (origin_code,),
+        ))
+        changed = [
+            (origin_code, code, stamp, price, date_obj.isoformat())
+            for _rank, _city, _state, code, _dist, date_obj, price, _mpd in rows
+            if last.get(code) != price
+        ]
+        with conn:  # one transaction
+            conn.executemany(
+                "INSERT INTO price_history (origin, dest, recorded_at, price, depart_date) VALUES (?, ?, ?, ?, ?)",
+                changed,
+            )
+    return len(changed)
+
+
+def load_price_history(origin_code, dest_code):
+    """Oldest-first list of (recorded_at: datetime, price, depart_date: str|None)."""
+    with closing(_open_history_db()) as conn:
+        found = conn.execute(
+            "SELECT recorded_at, price, depart_date FROM price_history "
+            "WHERE origin = ? AND dest = ? ORDER BY id",
+            (origin_code, dest_code),
+        ).fetchall()
+    return [(datetime.strptime(at, HISTORY_TIME_FORMAT), price, dep) for at, price, dep in found]
 
 
 # Floor on the auto-refresh interval so a typo (or "0") can't hammer southwest.com.
@@ -411,6 +471,150 @@ def export_xlsx(rows, path, origin_code, origin_label):
     wb.save(path)
 
 
+class PriceHistoryWindow(tk.Toplevel):
+    """Step chart of one route's recorded prices over time, drawn on a plain Tk
+    Canvas (no matplotlib, which would add ~30 MB to the .exe).
+
+    Only price *changes* are stored, so a price holds until the next recorded
+    point: hence a step line, extended with a dashed segment out to "now" to
+    show the latest price is still the current one."""
+
+    MARGIN = {"left": 70, "right": 30, "top": 20, "bottom": 50}
+    LINE_COLOR = "#004C97"
+
+    def __init__(self, master, title, history):
+        super().__init__(master)
+        self.title(title)
+        self.geometry("760x500")
+        self.minsize(480, 340)
+        self.history = history  # [(recorded_at, price, depart_date_iso), ...] oldest first
+        self.hover_points = []  # (x, y, tooltip text) for each recorded point
+
+        if history:
+            prices = [price for _at, price, _dep in history]
+            summary = (
+                f"Current ${history[-1][1]:,}    Lowest ${min(prices):,}    Highest ${max(prices):,}    "
+                f"{len(history)} recorded price(s) since {history[0][0]:%m/%d/%Y}"
+            )
+        else:
+            summary = "No price history recorded yet for this route."
+        ttk.Label(self, text=summary, padding=(10, 8)).pack(fill="x")
+
+        self.canvas = tk.Canvas(self, background="white", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, padx=10)
+        ttk.Label(
+            self,
+            text="Prices are recorded only when they change. The dashed line shows the latest price is still current.",
+            foreground="#666666", padding=(10, 6),
+        ).pack(fill="x")
+
+        self.canvas.bind("<Configure>", lambda _event: self.redraw())
+        self.canvas.bind("<Motion>", self.on_motion)
+        self.canvas.bind("<Leave>", lambda _event: self.canvas.delete("tooltip"))
+
+    @staticmethod
+    def _nice_axis(lo, hi):
+        """Round (lo, hi) outward to tidy dollar tick marks; returns (axis_min, axis_max, step)."""
+        pad = max((hi - lo) * 0.1, 5)  # breathing room, and a visible axis even for a flat price
+        lo, hi = max(0, lo - pad), hi + pad
+        raw_step = (hi - lo) / 5
+        magnitude = 10 ** math.floor(math.log10(raw_step))
+        step = next(factor * magnitude for factor in (1, 2, 5, 10) if factor * magnitude >= raw_step)
+        return math.floor(lo / step) * step, math.ceil(hi / step) * step, step
+
+    def redraw(self):
+        c = self.canvas
+        c.delete("all")
+        self.hover_points = []
+        width, height = c.winfo_width(), c.winfo_height()
+        left, right = self.MARGIN["left"], width - self.MARGIN["right"]
+        top, bottom = self.MARGIN["top"], height - self.MARGIN["bottom"]
+
+        if not self.history:
+            c.create_text(width / 2, height / 2, justify="center", fill="#666666",
+                          text="No price history recorded yet.\nIt builds up as you fetch.")
+            return
+        if right - left < 50 or bottom - top < 50:
+            return  # window too small to draw anything useful
+
+        t_start = self.history[0][0]
+        t_now = max(datetime.now(), self.history[-1][0])
+        # Show at least an hour so a brand-new route (one point, recorded minutes ago)
+        # gets distinct axis labels; the dashed "still current" line still stops at now.
+        t_end = max(t_now, t_start + timedelta(hours=1))
+        span = (t_end - t_start).total_seconds()
+
+        prices = [price for _at, price, _dep in self.history]
+        y_min, y_max, step = self._nice_axis(min(prices), max(prices))
+
+        inset = 12  # keeps the first/last dots and their labels off the axis lines
+
+        def x_of(when):
+            return left + inset + (right - left - 2 * inset) * (when - t_start).total_seconds() / span
+
+        def y_of(price):
+            return bottom - (bottom - top) * (price - y_min) / (y_max - y_min)
+
+        value = y_min
+        while value <= y_max + 1e-9:
+            y = y_of(value)
+            c.create_line(left, y, right, y, fill="#e6e6e6")
+            c.create_text(left - 8, y, text=f"${value:,.0f}", anchor="e", fill="#444444")
+            value += step
+
+        date_format = "%m/%d\n%H:%M" if span < 2 * 86400 else "%m/%d/%y"
+        for i in range(5):
+            when = t_start + (t_end - t_start) * i / 4
+            x = x_of(when)
+            c.create_line(x, bottom, x, bottom + 5, fill="#888888")
+            c.create_text(x, bottom + 8, text=when.strftime(date_format), anchor="n",
+                          fill="#444444", justify="center")
+
+        c.create_line(left, top, left, bottom, fill="#888888")
+        c.create_line(left, bottom, right, bottom, fill="#888888")
+
+        # Step path: hold the old price until each change, then jump to the new one.
+        coords = []
+        held_y = None
+        for when, price, _dep in self.history:
+            x, y = x_of(when), y_of(price)
+            if held_y is not None:
+                coords += [x, held_y]
+            coords += [x, y]
+            held_y = y
+        if len(coords) >= 4:
+            c.create_line(*coords, fill=self.LINE_COLOR, width=2)
+        last_x, end_x = coords[-2], x_of(t_now)
+        if end_x - last_x > 2:
+            c.create_line(last_x, held_y, end_x, held_y, fill=self.LINE_COLOR, width=2, dash=(4, 3))
+
+        label_dots = len(self.history) <= 12  # beyond that, labels would pile up; use hover instead
+        for when, price, depart in self.history:
+            x, y = x_of(when), y_of(price)
+            c.create_oval(x - 4, y - 4, x + 4, y + 4, fill=self.LINE_COLOR, outline="white")
+            if label_dots:
+                c.create_text(x, y - 10, text=f"${price:,}", anchor="s", fill=self.LINE_COLOR)
+            tip = f"${price:,}\n{when:%b %d, %Y %H:%M}"
+            if depart:
+                tip += f"\nDeparting {fmt_date(datetime.fromisoformat(depart))}"
+            self.hover_points.append((x, y, tip))
+
+    def on_motion(self, event):
+        c = self.canvas
+        c.delete("tooltip")
+        if not self.hover_points:
+            return
+        x, y, tip = min(self.hover_points, key=lambda p: (p[0] - event.x) ** 2 + (p[1] - event.y) ** 2)
+        if (x - event.x) ** 2 + (y - event.y) ** 2 > 14 ** 2:
+            return
+        text = c.create_text(x + 12, y - 12, text=tip, anchor="sw", justify="left", tags="tooltip")
+        x1, y1, x2, y2 = c.bbox(text)
+        c.move(text, min(0, c.winfo_width() - 6 - x2), max(0, 6 - y1))  # keep it inside the canvas
+        x1, y1, x2, y2 = c.bbox(text)
+        box = c.create_rectangle(x1 - 4, y1 - 3, x2 + 4, y2 + 3, fill="#ffffe0", outline="#999999", tags="tooltip")
+        c.tag_lower(box, text)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -495,6 +699,8 @@ class App(tk.Tk):
         ttk.Label(refresh, text="minutes").pack(side="left")
         self.auto_refresh_btn = ttk.Button(refresh, text="Start Auto-Refresh", command=self.toggle_auto_refresh)
         self.auto_refresh_btn.pack(side="left", padx=(8, 0))
+        ttk.Label(refresh, text="Tip: double-click a row to see its price history",
+                  foreground="#666666").pack(side="right")
 
         self.status_var = tk.StringVar(value="Click \"Fetch Latest Deals\" to load current fares from southwest.com.")
         # Packed with side="bottom" *before* the tree so it reserves the
@@ -523,6 +729,7 @@ class App(tk.Tk):
 
         self.tree.tag_configure("price_up", background="#f8d7da")    # light red
         self.tree.tag_configure("price_down", background="#d4edda")  # light green
+        self.tree.bind("<Double-1>", self.on_row_double_click)
 
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -716,7 +923,34 @@ class App(tk.Tk):
         status = f"Loaded {len(self.rows)} destinations from {origin_label} ({origin_code}) as of {timestamp}."
         if previous_prices:
             status += f" Since last fetch: {up} up, {down} down, {same} unchanged."
+
+        # Persist to the local price history (only prices that changed since the
+        # last stored one). A failure here shouldn't fail the fetch itself.
+        try:
+            saved = record_prices(origin_code, payload)
+            if saved:
+                status += f" Saved {saved} price(s) to history."
+        except (sqlite3.Error, OSError) as exc:
+            status += f" (Couldn't save price history: {exc})"
         self.status_var.set(status)
+
+    def on_row_double_click(self, event):
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return  # a double-click on a column header or empty space
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        values = self.tree.item(item, "values")
+        city, state, dest = values[1], values[2], values[3]
+        # previous_origin_code is the origin of the rows currently in the table;
+        # self.origin_code may already point at a newer dropdown selection.
+        origin = self.previous_origin_code
+        try:
+            history = load_price_history(origin, dest)
+        except (sqlite3.Error, OSError) as exc:
+            messagebox.showerror("Price history", f"Couldn't read the price history: {exc}")
+            return
+        PriceHistoryWindow(self, f"Price history — {city}, {state} ({origin} → {dest})", history)
 
     def populate_tree(self):
         self.tree.delete(*self.tree.get_children())
