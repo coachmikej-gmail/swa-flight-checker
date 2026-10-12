@@ -4,6 +4,38 @@ All notable changes to `swa_deals_gui.pyw` (formerly `swa_deals_gui.py`,
 and before that `bwi_deals_gui.py`; and its companion script,
 `build_bwi_deals.py`), newest first.
 
+## 1.14.0 — Background watcher
+- **`swa_watcher.py`:** a headless checker that runs your price watches without
+  the app open. Each run reads `settings.json`, fetches fares for each home
+  airport that has a watch, records price changes in `price_history.db`, and
+  sends Telegram alerts using the same rules as the app. It logs to
+  `watcher.log` and supports `--dry-run` (send nothing, change nothing) and
+  `--only-between START-END` (skip quietly outside those hours).
+- **Scheduled task:** `install_watcher_task.ps1` installs a Windows task that
+  runs the watcher hourly from 6:00 to 23:00 (18 runs a day) and wakes the PC
+  from sleep to do it (`-Uninstall` removes it). It uses one daily trigger per
+  hour rather than a single repeating trigger, because on the repeating form
+  Windows armed a wake timer only for the next day's first run, so the PC never
+  woke for the hourly ones. Verified: the PC woke itself from sleep at the top
+  of the hour (wake source "Presume Wake Timer") and the watcher ran.
+- **Failure heads-up:** if every fetch fails 3 runs in a row (e.g. Southwest
+  changed its site) the watcher sends one Telegram message, and another when it
+  recovers, so it can't fail silently.
+- **Shared code:** the non-GUI logic (fetching, price history, settings,
+  Telegram, and the price-watch alert rules) moved into `swa_core.py`, used by
+  both the app and the watcher so they can't drift apart. `swa_deals_gui.pyw`
+  now imports it, so keep the two files together. No change in app behavior.
+- **No double alerts:** the app re-reads each watch's alert state from
+  `settings.json` before checking, so a drop the watcher already alerted about
+  isn't announced again. The watcher writes only alert-state changes, re-reading
+  the file first, so it never overwrites watches you edit in the app.
+- Saving `settings.json` now retries briefly if Windows reports "Access is
+  denied" (another process holding the file for a moment), since the app and the
+  watcher now share it.
+- Added `test_wake.ps1`, a 5-minute diagnostic that checks whether the PC can
+  wake itself from sleep. `watcher.log` and the watcher's state file are
+  git-ignored.
+
 ## 1.13.0 — Price watches and Telegram alerts
 - **Price watches:** set a target price for any destination (right-click a
   row, or select it and use the new **Alerts** menu). When that route's fare

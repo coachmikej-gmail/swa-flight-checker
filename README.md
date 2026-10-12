@@ -24,7 +24,10 @@ to PDF/XLSX, and auto-refreshed on a timer.
 - Optional auto-refresh on a timer you set, in minutes
 - Export results to a formatted PDF table or an Excel workbook (with live
   formulas, not just hardcoded values)
-- Portable — a single `.pyw` file, or build it into a standalone `.exe`
+- Background watcher: a scheduled task checks your price watches every hour
+  (6am–11pm), even while the app is closed and the PC is asleep
+- Portable — `swa_deals_gui.pyw` plus `swa_core.py` (keep them together), or
+  build it into a standalone `.exe`
 
 ## Price watches & Telegram alerts
 
@@ -49,6 +52,42 @@ retried on the next fetch.
 The bot token, chat ID, and your watches are stored in `settings.json` next to
 the app. The token is in plain text, so keep that file private — it's
 git-ignored, so it won't be committed, but don't share the folder with it inside.
+
+## Background watcher (checks while the app is closed)
+
+`swa_watcher.py` is a small headless script that does what the app's alerts do,
+without a window: it reads `settings.json`, fetches fares for each home airport
+you have watches on, records price changes in `price_history.db`, and sends
+Telegram alerts using the same rules as the app. It writes `watcher.log`.
+
+To run it automatically every hour from 6:00 to 23:00 — waking a sleeping PC
+to do it — install the Windows scheduled task (no admin needed):
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\install_watcher_task.ps1
+```
+
+Remove it with `... -File .\install_watcher_task.ps1 -Uninstall`. Change the hours
+with `-StartHour` / `-EndHour`.
+
+Things to know:
+- The PC must be **asleep, not shut down**, and you must stay **logged in** (a locked
+  screen is fine). With Fast Startup on, "Shut down" is a hibernate-style state that
+  may not wake — use Sleep.
+- Waking from sleep needs **Allow wake timers** enabled in your power plan
+  (Power Options → Change plan settings → Advanced → Sleep).
+- Try it safely any time: `python swa_watcher.py --dry-run` shows what it would
+  send without sending anything or changing any files.
+- If every fetch fails 3 runs in a row (e.g. Southwest changed its site), it sends
+  you one Telegram heads-up, and another when it recovers, so it can't fail silently.
+- Using the app at the same time is fine: both share `settings.json`, and the app
+  re-reads each watch's alert state before checking, so you won't get duplicate alerts.
+- To check that waking works on your PC, look in `watcher.log` after the PC has slept
+  through the top of an hour: a run at `HH:00:xx` means it woke itself. For a quick
+  5-minute test, run `powershell -ExecutionPolicy Bypass -File .\test_wake.ps1` and
+  follow its instructions. If your PC never wakes, `powercfg /waketimers` (run as
+  administrator) shows whether Windows armed the timer; if it did, look in your BIOS for
+  an RTC/timer-wake setting (the name varies by board, e.g. "Power On By RTC").
 
 ## Requirements
 
